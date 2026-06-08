@@ -1,2 +1,32 @@
 #!/bin/sh
-exec "$HOME/bin/autohand" "$@"
+# ah — autohand on the FREE default, with automatic fail-over across free models.
+# Headless (`ah -p "task"`): if a free model is rate-limited/unavailable, it auto-retries
+# the next free model until one works — so a single `ah` just keeps going, $0.
+# Interactive (`ah` with no -p): launches normally (autohand can't auto-flip a live chat;
+# use /model inside, or ah-grok/ah-gpt for a paid brain).
+GUARD="$HOME/bin/autohand"
+
+# Free fallback ladder (ordered by tested availability/capability). All :free = $0.
+FREE_MODELS="openai/gpt-oss-120b:free google/gemma-4-31b-it:free openai/gpt-oss-20b:free meta-llama/llama-3.3-70b-instruct:free qwen/qwen3-coder:free"
+
+# Only auto-retry in headless mode (-p / --prompt). Interactive -> plain launch.
+case " $* " in
+  *" -p "*|*" --prompt "*) ;;
+  *) exec "$GUARD" "$@" ;;
+esac
+
+# Reliable autohand/OpenRouter failure markers (a successful run shows "N tokens used").
+ERR='Session failed|tokens unavailable|Missing Authentication|Authentication failed|requested model was not found|model was not found|429|rate.?limit|rate limited|No endpoints found|temporarily unavailable|overloaded|provider returned error|model_not_found|quota'
+tmp="$(mktemp -t ah.XXXXXX)"
+for m in $FREE_MODELS; do
+  "$GUARD" --model "$m" "$@" 2>&1 | tee "$tmp"
+  if grep -qiE "$ERR" "$tmp"; then
+    short="${m##*/}"
+    printf '\033[33mah: free model %s is busy — auto-switching to the next free model...\033[0m\n' "$short" >&2
+    continue
+  fi
+  rm -f "$tmp"; exit 0
+done
+rm -f "$tmp"
+printf '\033[31mah: every free model is rate-limited right now. Re-run, or use a paid model: ah-grok / ah-gpt (asks to confirm).\033[0m\n' >&2
+exit 1

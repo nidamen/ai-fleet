@@ -4,7 +4,7 @@ A free-first, never-stuck setup for running coding agents through **OpenRouter**
 
 ## What it gives you
 
-- **`ah`** — autohand on a **free** OpenRouter model (default `openai/gpt-oss-120b:free`). Always works: a launch guard re-injects your API key from the Keychain and re-pins the free model on every launch, so a stale key or a cloud-sync clobber can never break you.
+- **`ah`** — autohand on a **free** OpenRouter model (default `openai/gpt-oss-120b:free`). Always works: a launch guard re-injects your API key from the Keychain and re-pins the free model on every launch, so a stale key or a cloud-sync clobber can never break you. In headless mode (`ah -p "task"`) it **auto-fails-over across free models** if one is rate-limited, so a single `ah` just keeps going — all $0. (Live interactive chat can't auto-flip; use `/model` or a paid launcher.)
 - **Paid only when you confirm** — `ah-gpt`, `ah-claude`, `ah-grok`, `ah-gemini` show the exact `$/M` price and refuse to run until you type `yes`. `ah` / `ah-free` are always free.
 - **`aicost`** — exactly what you're paying: live OpenRouter session spend, balance, current model rate, plus your subscription quotas. `aicost --watch` is a live ticker; `aicost --reset` zeroes the session.
 - **`ai-status`** — fleet dashboard: per-provider quota + reset dates + the launcher cheatsheet. Shows automatically when you open [Ghostty](https://ghostty.org).
@@ -23,7 +23,7 @@ Open a new terminal, then just type **`ah`**.
 
 | Command | What it does | Cost |
 |---|---|---|
-| `ah` / `ah-free` | autohand on the free default model | **$0** |
+| `ah` / `ah-free` | autohand on the free default; `ah -p` auto-fails-over across free models on rate-limit | **$0** |
 | `ah-gpt` / `ah-claude` / `ah-grok` / `ah-gemini` | autohand on that paid model (confirms first) | metered |
 | `ai-status` | fleet dashboard (quotas, resets, launchers) | $0 |
 | `aicost` | spend dashboard; `--watch` live; `--reset` zero session | $0 |
