@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""aicost — exactly what you're paying. OpenRouter live spend ($) + subscription quotas.
+  aicost           dashboard (refreshes if cache > 45s)
+  aicost --watch   live ticker (updates every 3s) — use while on a PAID model
+  aicost --line    one compact line for the prompt (cache-only, instant)
+  aicost --reset   zero the session counter (baseline = current spend)
+  aicost --refresh force a live pull now
+Managed by Claude. See ~/.claude memory reference_autohand_openrouter."""
+import json, os, sys, time, subprocess, datetime, pathlib, urllib.request
+
+CFG = pathlib.Path.home() / ".config" / "ai-status"; CFG.mkdir(parents=True, exist_ok=True)
+CACHE = CFG / "aicost.cache"        # {"remaining":..,"used":..,"ts":..}
+SESS = CFG / "session.json"         # {"baseline_used":..,"since":..}
+CLAUDE_ST = pathlib.Path.home() / ".agent-continuity" / "status" / "claude.json"
+AH_CFG = pathlib.Path.home() / ".autohand" / "config.json"
+QUOTAS = CFG / "quotas.json"
+C = sys.stdout.isatty()
+def col(s, c): return f"\033[{c}m{s}\033[0m" if C else s
+
+def pull():
+    key = subprocess.run(["/usr/bin/security","find-generic-password","-s","openrouter","-a",(os.environ.get("AI_FLEET_OR_ACCOUNT") or __import__("getpass").getuser()),"-w"],
+                         capture_output=True, text=True, timeout=5).stdout.strip()
+    req = urllib.request.Request("https://openrouter.ai/api/v1/credits", headers={"Authorization": f"Bearer {key}"})
+    d = json.loads(urllib.request.urlopen(req, timeout=6).read()).get("data", {})
+    used = round(float(d.get("total_usage", 0)), 4); total = round(float(d.get("total_credits", 0)), 4)
+    CACHE.write_text(json.dumps({"remaining": round(total-used,4), "used": used, "ts": time.time()}))
+    return {"remaining": round(total-used,4), "used": used, "ts": time.time()}
+
+def cache(max_age=45, allow_pull=True):
+    try:
+        c = json.loads(CACHE.read_text())
+        if time.time() - c.get("ts",0) < max_age or not allow_pull: return c
+    except Exception: c = None
+    if allow_pull:
+        try: return pull()
+        except Exception:
+            return c or {"remaining": None, "used": None, "ts": 0}
+    return c or {"remaining": None, "used": None, "ts": 0}
+
+def session(used):
+    try: s = json.loads(SESS.read_text())
+    except Exception: s = None
+    if s is None and used is not None:
+        s = {"baseline_used": used, "since": time.time()}; SESS.write_text(json.dumps(s))
+    if s is None: return None, None
+    spent = round(used - s["baseline_used"], 4) if used is not None else None
+    return spent, s.get("since")
+
+def cur_model():
+    try: return json.loads(AH_CFG.read_text())["openrouter"]["model"]
+    except Exception: return "?"
+
+def is_free(m): return m.endswith(":free")
+
+if "--reset" in sys.argv:
+    c = cache(0); SESS.write_text(json.dumps({"baseline_used": c.get("used") or 0, "since": time.time()}))
+    print(f"session counter reset (spend now $0.00). lifetime used ${c.get('used')}"); sys.exit(0)
+
+if "--line" in sys.argv:
+    c = cache(99999, allow_pull=False)  # instant, never blocks the prompt
+    if time.time() - c.get("ts",0) > 45:  # self-freshen in background, deduped
+        lock = CFG / ".refresh.lock"
+        try:
+            if not lock.exists() or time.time()-lock.stat().st_mtime > 30:
+                lock.touch(); os.system(f"({sys.executable} {os.path.abspath(__file__)} --refresh >/dev/null 2>&1 &)")
+        except Exception: pass
+    spent,_ = session(c.get("used")); m = cur_model(); rem = c.get("remaining")
+    tag = col("FREE", "32") if is_free(m) else col("PAID", "31")
+    if spent is None: sp = "$?"
+    else:
+        amt = f"${spent:.4f}" if 0 < spent < 1 else f"${spent:.2f}"
+        sp = col(amt, "32" if spent == 0 else "33")
+    short = m.split("/")[-1].replace(":free","")
+    print(f"{col('🤖','2')} {short} {tag} · sess {sp} · OR ${rem if rem is not None else '?'}")
+    sys.exit(0)
+
+if "--refresh" in sys.argv:
+    try: pull(); print("refreshed.") if C else None
+    except Exception as e: print("refresh failed:", e)
+    if "--watch" not in sys.argv: sys.exit(0)
+
+def render():
+    c = cache(0 if "--refresh" in sys.argv else 45)
+    spent, since = session(c.get("used")); m = cur_model(); rem = c.get("remaining"); used = c.get("used")
+    free = is_free(m)
+    print(col("\n💸 OpenRouter", "1") + f"   balance {col('$'+str(rem) if rem is not None else '$?','1')}   "
+          f"session {col(('$%.4f'%spent) if spent is not None else '$?', '32' if (spent or 0)==0 else '33')}"
+          + (f"   lifetime used ${used}" if used is not None else ""))
+    when = datetime.datetime.fromtimestamp(since).strftime('%-I:%M%p').lower() if since else "?"
+    print(col(f"   session counter since {when}  (zero it: aicost --reset)","2"))
+    rate = col("$0 / FREE","32") if free else col("PAID — spending credits","31")
+    print(f"   current model: {col(m,'1')}   {rate}")
+    # subscriptions = flat-rate, $0 marginal
+    try: cl = json.loads(CLAUDE_ST.read_text()); clq = f"5h {cl.get('five_hour')}% · wk {cl.get('seven_day')}%"
+    except Exception: clq = "?"
+    try: q = json.loads(QUOTAS.read_text())
+    except Exception: q = {}
+    cx = "capped→Jun 10 5:59pm" if q.get("codex",{}).get("status")=="maxed" else "ok"
+    gk = "needs SuperGrok" if q.get("grok",{}).get("status")=="maxed" else "ok"
+    print(col("   Subscriptions (flat-rate, $0 marginal): ","2") + f"Claude {clq} · Codex {cx} · Grok {gk}")
+    print(col("   live ticker while on a paid model: ","2") + "aicost --watch\n")
+
+if "--watch" in sys.argv:
+    try:
+        while True:
+            os.system("clear" if C else "")
+            try: pull()
+            except Exception: pass
+            render(); print(col("   (live · ctrl-C to stop)","2"))
+            time.sleep(3)
+    except KeyboardInterrupt:
+        print("\nstopped."); sys.exit(0)
+
+render()

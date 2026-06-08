@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "$HOME/bin/.ah-paid-run" 'google/gemini-3.5-flash' '$1.50 / $9 per M' "$@"

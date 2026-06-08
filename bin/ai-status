@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""ai-status — one-glance view of your AI fleet: quotas, reset dates, launchers.
+   ai-status            normal (refreshes OpenRouter $ if cache > 6h old)
+   ai-status --fast     cache-only, zero network (used by the Ghostty banner)
+   ai-status --refresh  force-refresh OpenRouter balance now
+Managed by Claude. See ~/.claude memory reference_autohand_openrouter."""
+import json, os, sys, time, subprocess, datetime, pathlib, urllib.request
+
+HOME = pathlib.Path.home()
+CFG = HOME / ".config" / "ai-status"
+CFG.mkdir(parents=True, exist_ok=True)
+QUOTAS = CFG / "quotas.json"          # editable: codex/grok status+reset
+OR_CACHE = CFG / "openrouter.cache"   # {"remaining":..,"ts":..}
+CLAUDE_ST = HOME / ".agent-continuity" / "status" / "claude.json"
+
+FAST = "--fast" in sys.argv
+REFRESH = "--refresh" in sys.argv
+C = sys.stdout.isatty()
+def col(s, c): return f"\033[{c}m{s}\033[0m" if C else s
+GRN, RED, YEL, DIM, BOLD = "32", "31", "33", "2", "1"
+
+def fmt_epoch(e):
+    try: return datetime.datetime.fromtimestamp(int(e)).strftime("%a %b %-d %-I:%M%p").replace("AM","am").replace("PM","pm")
+    except Exception: return "?"
+
+def fmt_dt(s):
+    for f in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
+        try: return datetime.datetime.strptime(s, f)
+        except Exception: pass
+    return None
+
+def engine_up():
+    try:
+        out = subprocess.run(["launchctl","list"], capture_output=True, text=True, timeout=5).stdout
+        ops = [l for l in out.splitlines() if "agent-continuity-operator" in l or "agent-continuity-exec" in l]
+        return sum(1 for l in ops if l.split("\t")[0].strip().lstrip("-").isdigit())
+    except Exception: return 0
+
+def openrouter_remaining():
+    if not REFRESH and not FAST and OR_CACHE.exists():
+        try:
+            c = json.loads(OR_CACHE.read_text())
+            if time.time() - c.get("ts", 0) < 6*3600: return c.get("remaining"), False
+        except Exception: pass
+    if FAST:
+        try: return json.loads(OR_CACHE.read_text()).get("remaining"), True
+        except Exception: return None, True
+    try:
+        key = subprocess.run(["/usr/bin/security","find-generic-password","-s","openrouter","-a",(os.environ.get("AI_FLEET_OR_ACCOUNT") or __import__("getpass").getuser()),"-w"],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        req = urllib.request.Request("https://openrouter.ai/api/v1/credits", headers={"Authorization": f"Bearer {key}"})
+        d = json.loads(urllib.request.urlopen(req, timeout=6).read()).get("data", {})
+        rem = round(d.get("total_credits", 0) - d.get("total_usage", 0), 2)
+        OR_CACHE.write_text(json.dumps({"remaining": rem, "ts": time.time()}))
+        return rem, False
+    except Exception:
+        try: return json.loads(OR_CACHE.read_text()).get("remaining"), True
+        except Exception: return None, True
+
+def claude_row():
+    try:
+        d = json.loads(CLAUDE_ST.read_text())
+        h, w = d.get("five_hour"), d.get("seven_day")
+        avail = d.get("available", True) and (isinstance(h,(int,float)) and h < 100)
+        dot = col("●", GRN) if avail else col("✖", RED)
+        st = f"5h {h}% · wk {w}%" if h is not None else "unknown"
+        res = f"5h {fmt_epoch(d['five_hour_resets'])} · wk {fmt_epoch(d['seven_day_resets'])}" if d.get("five_hour_resets") else "-"
+        return dot, ("open" if avail else "MAXED"), st, res
+    except Exception:
+        return col("?", DIM), "?", "(engine offline?)", "-"
+
+def quota_row(key):
+    try: q = json.loads(QUOTAS.read_text()).get(key, {})
+    except Exception: q = {}
+    status = q.get("status", "?"); resets = q.get("resets"); note = q.get("note", "")
+    if status == "maxed":
+        dt = fmt_dt(resets) if resets else None
+        if dt and dt < datetime.datetime.now():
+            return col("↻", YEL), "should be reset", "", f"verify (was {resets})"
+        when = dt.strftime("%a %b %-d %-I:%M%p").replace("AM","am").replace("PM","pm") if dt else (note or "no auto-reset")
+        return col("✖", RED), "MAXED", "", when
+    return col("●", GRN), status or "open", "", (note or "")
+
+# ---- render ----
+up = engine_up()
+rem, stale = openrouter_remaining()
+edot = col("● running", GRN) if up >= 2 else (col(f"◐ {up}/2 up", YEL) if up else col("✖ OFFLINE — run: agentctl reload", RED))
+print(col("\n🤖 AI FLEET", BOLD) + f"   continuity engine: {edot}")
+print(col("  provider      plan          status            resets / note", DIM))
+def line(name, plan, dot, state, detail, when):
+    s = f"{state} {detail}".strip()
+    print(f"  {name:<13} {plan:<13} {dot} {s:<14} {col(when, DIM)}")
+cd, cs, cdet, cres = claude_row()
+line("Claude", "subscription", cd, cs, cdet, cres)
+gd, gs, _, gw = quota_row("codex"); line("Codex/GPT", "subscription", gd, gs, "", gw)
+rd, rs, _, rw = quota_row("grok");  line("Grok", "subscription", rd, rs, "", rw)
+ordot = col("●", GRN) if (rem is None or rem > 1) else col("✖", RED)
+orwhen = "metered · free models = $0" + ("  (cached)" if stale else "")
+line("OpenRouter", "API credits", ordot, (f"${rem} left" if rem is not None else "?"), "", orwhen)
+
+print(col("\n  Launchers", BOLD) + col("  (route via OpenRouter API + auto-heal key — NOT your subscriptions):", DIM))
+print("    " + col("ah", BOLD) + "         fast free default (gpt-oss-120b, $0)")
+print("    " + col("ah-gpt", BOLD) + "  GPT-5.5    " + col("ah-claude", BOLD) + "  Claude Opus 4.8    " +
+      col("ah-grok", BOLD) + "  Grok 4.3    " + col("ah-gemini", BOLD) + "  Gemini (cheap)")
+print(col("  Subscriptions", BOLD) + col(" (flat-rate, your plans): ", DIM) + col("claude", BOLD) +
+      "  ·  " + col("codex", BOLD) + "  ·  " + col("grok", BOLD))
+print(col("  detail/refresh: ", DIM) + "ai-status --refresh\n")

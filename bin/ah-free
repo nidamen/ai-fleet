@@ -1,0 +1,3 @@
+#!/bin/sh
+# autohand on best free model ($0)  (managed by Claude) — launches autohand on a fixed model, through the key-healing guard.
+exec "$HOME/bin/autohand" --model "openai/gpt-oss-120b:free" "$@"

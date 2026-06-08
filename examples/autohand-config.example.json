@@ -1,0 +1,8 @@
+{
+  "provider": "openrouter",
+  "openrouter": {
+    "apiKey": "REPLACE_OR_LEAVE_BLANK_the_guard_injects_from_Keychain",
+    "model": "openai/gpt-oss-120b:free",
+    "baseUrl": "https://openrouter.ai/api/v1"
+  }
+}

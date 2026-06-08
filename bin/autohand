@@ -1,0 +1,47 @@
+#!/bin/sh
+# autohand launch guard (managed by Claude — see ~/.claude memory reference_autohand_openrouter)
+# On EVERY launch: (1) heal the OpenRouter key from Keychain, (2) pin the preferred default
+# model — and ENFORCE FREE-ONLY: if the pinned/config model is not a ':free' model and the
+# owner has NOT opted into paid (marker ~/.autohand/.allow-paid), force the free default.
+# Per-run --model from the ah-gpt/ah-claude/ah-grok launchers still overrides for that run
+# (those launchers do their own paid confirmation). Real binary: ~/.local/bin/autohand.
+REAL="$HOME/.local/bin/autohand"
+CFG="$HOME/.autohand/config.json"
+PREF="$HOME/.autohand/.preferred-model"
+FREE_DEFAULT="openai/gpt-oss-120b:free"
+
+if [ -f "$CFG" ]; then
+  KEY="$(/usr/bin/security find-generic-password -s openrouter -a "${AI_FLEET_OR_ACCOUNT:-$USER}" -w 2>/dev/null)"
+  MODEL=""; [ -f "$PREF" ] && MODEL="$(tr -d '[:space:]' < "$PREF" 2>/dev/null)"
+  [ -n "$MODEL" ] || MODEL="$FREE_DEFAULT"
+  ALLOW_PAID=0; [ -f "$HOME/.autohand/.allow-paid" ] && ALLOW_PAID=1
+  AH_KEY="$KEY" AH_MODEL="$MODEL" AH_FREE="$FREE_DEFAULT" AH_ALLOW_PAID="$ALLOW_PAID" \
+    /usr/bin/python3 - "$CFG" >/dev/null 2>&1 <<'PY'
+import json, os, sys
+cfg = sys.argv[1]
+key = os.environ.get("AH_KEY", "")
+model = os.environ.get("AH_MODEL", "")
+free = os.environ.get("AH_FREE", "openai/gpt-oss-120b:free")
+allow_paid = os.environ.get("AH_ALLOW_PAID") == "1"
+# OWNER RULE: the persistent default must be FREE unless paid is explicitly allowed.
+if model and not model.endswith(":free") and not allow_paid:
+    model = free
+try:
+    with open(cfg) as f:
+        c = json.load(f)
+    o = c.get("openrouter")
+    if isinstance(o, dict):
+        changed = False
+        if key.startswith("sk-or-v1-") and o.get("apiKey") != key:
+            o["apiKey"] = key; changed = True
+        if model and o.get("model") != model:
+            o["model"] = model; changed = True
+        if changed:
+            with open(cfg, "w") as f:
+                f.write(json.dumps(c, indent=2) + "\n")
+except Exception:
+    pass  # never block autohand from launching
+PY
+fi
+
+exec "$REAL" "$@"

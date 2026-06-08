@@ -1,0 +1,10 @@
+#!/bin/sh
+# Confirm before running a PAID OpenRouter model. Bypass with PAID_OK=1 or ~/.autohand/.allow-paid.
+MODEL="$1"; RATE="$2"; shift 2
+if [ ! -f "$HOME/.autohand/.allow-paid" ] && [ "${PAID_OK:-}" != "1" ]; then
+  printf '\033[33m⚠  PAID model: %s  (%s)\033[0m\n' "$MODEL" "$RATE" >&2
+  printf '   Free option is `ah`. Type "yes" to spend OpenRouter credits: ' >&2
+  ans=""; { read ans < /dev/tty; } 2>/dev/null
+  case "$ans" in yes|YES|y|Y) ;; *) echo "   cancelled — staying free (set PAID_OK=1 to skip this)." >&2; exit 1 ;; esac
+fi
+exec "$HOME/bin/autohand" --model "$MODEL" "$@"
