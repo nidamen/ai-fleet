@@ -2,6 +2,8 @@
 
 A free-first, never-stuck setup for running coding agents through **OpenRouter** (via [autohand](https://autohand.ai)) with a **live cost meter** and a one-glance fleet dashboard. Built so you can switch between models without ever exiting your CLI, never get surprise-billed, and bootstrap the whole thing on a fresh machine in one command.
 
+> **New here?** Read [`WHITEPAPER.md`](WHITEPAPER.md) for the why, the design, and the economics in plain language. Then come back here for the commands.
+
 ## What it gives you
 
 - **`ah`** — autohand on a **free** OpenRouter model (default `openai/gpt-oss-120b:free`). Always works: a launch guard re-injects your API key from the Keychain and re-pins the free model on every launch, so a stale key or a cloud-sync clobber can never break you. In headless mode (`ah -p "task"`) it **auto-fails-over across free models** if one is rate-limited, so a single `ah` just keeps going — all $0. (Live interactive chat can't auto-flip; use `/model` or a paid launcher.)
