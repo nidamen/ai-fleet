@@ -1,0 +1,119 @@
+#!/bin/sh
+# autohand-refork — keep the patched autohand fork in sync with the stock binary.
+#
+# WHY: autohand 0.9.1's git_add tool crashes ("Spread syntax requires ...iterable")
+# when the model omits `paths`, because gitAdd does `["add", ...paths]` and later
+# `paths.join(...)` with no guard. We ship a length-preserving byte-patched FORK at
+# ~/bin/.autohand-patched (re-signed ad-hoc) that the ~/bin/autohand launch guard
+# prefers. When autohand UPDATES, the stock binary changes and the fork goes stale,
+# so this script rebuilds the fork from the new stock binary.
+#
+# IDEMPOTENT + SELF-HEALING:
+#   * No-op when the fork already matches the current stock binary (hash-gated).
+#   * If autohand changed gitAdd so the patch patterns are GONE (e.g. upstream fixed
+#     the bug, or restructured the code), it REMOVES the fork so the guard cleanly
+#     falls back to the stock binary — never ships a half-patched/broken fork.
+# Run any time; called by the daily LaunchAgent and (fast path) by the launch guard.
+set -u
+STOCK="$HOME/.local/bin/autohand"
+FORK="$HOME/bin/.autohand-patched"
+HASHFILE="$HOME/bin/.autohand-patched.srchash"
+LOG="$HOME/Library/Logs/autohand-refork.log"
+say() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null; }
+
+[ -f "$STOCK" ] || { say "stock binary missing ($STOCK) — nothing to do"; exit 0; }
+
+curhash="$(/usr/bin/shasum -a256 "$STOCK" 2>/dev/null | awk '{print $1}')"
+[ -n "$curhash" ] || exit 0
+
+# Up to date? (fork exists AND was built from this exact stock binary)
+if [ -x "$FORK" ] && [ -f "$HASHFILE" ] && [ "$(cat "$HASHFILE" 2>/dev/null)" = "$curhash" ]; then
+  exit 0
+fi
+
+say "stock changed (sha=$curhash) — rebuilding patched fork"
+TMP="$FORK.tmp.$$"
+cp "$STOCK" "$TMP" 2>/dev/null || { say "cp failed"; rm -f "$TMP"; exit 1; }
+
+# Apply the three length-preserving byte patches. Exit non-zero if a pattern is missing.
+if AH_TMP="$TMP" /usr/bin/python3 - <<'PY'
+import os, sys
+p = os.environ["AH_TMP"]
+data = bytearray(open(p, "rb").read())
+
+# Patch A: the spread crash. Guard `paths` -> stage all (".") when omitted. Equal length
+# is funded by compressing whitespace on the following spawnSync3 line.
+spanA = (b'const args = ["add", ...paths];\n'
+         b'  const result = spawnSync3("git", args, { cwd: cwd2, encoding: "utf8" });')
+replA = (b'const args = ["add", ...(paths||["."])];\n'
+         b'  const result=spawnSync3("git",args,{cwd:cwd2,encoding:"utf8"});')
+
+# Patch B: the return line also derefs bare `paths` (paths.join). Drop it; pad to length.
+spanB = b'  return result.stdout || `Staged ${paths.join(", ")}`;'
+replB = b'  return result.stdout || "Staged";'
+replB = replB + b' ' * (len(spanB) - len(replB))
+
+# Patch C: post-/login cloud-restore flow ignores the local sync.enabled=false and can
+# re-run the cloud-wins config clobber (autohandai/code-cli#236). Add an early return
+# honoring the local setting; fund the bytes by compressing the createSyncService args.
+spanC = (b'async function checkAndRestoreSyncData(token, userId, config) {\n'
+         b'  try {\n'
+         b'    const syncService = createSyncService({\n'
+         b'      authToken: token,\n'
+         b'      userId,\n'
+         b'      config: {\n'
+         b'        ...DEFAULT_SYNC_CONFIG,\n'
+         b'        ...config.sync,\n'
+         b'        enabled: true\n'
+         b'      }\n'
+         b'    });\n')
+replC = (b'async function checkAndRestoreSyncData(token, userId, config) {\n'
+         b'  if (config.sync?.enabled === false) return;\n'
+         b'  try {\n'
+         b'    const syncService = createSyncService({ authToken: token, userId, config: { ...DEFAULT_SYNC_CONFIG, ...config.sync, enabled: true } });')
+replC = replC + b' ' * (len(spanC) - len(replC) - 1) + b'\n'
+
+ok = True
+for span, repl in ((spanA, replA), (spanB, replB), (spanC, replC)):
+    if data.count(span) != 1 or len(repl) != len(span):
+        ok = False; break
+    i = data.find(span); data[i:i+len(span)] = repl
+
+if not ok:
+    print("PATTERN_MISSING"); sys.exit(3)
+
+# sanity: crashing patterns gone, guards present
+out = bytes(data)
+if out.count(b'["add", ...paths]') or out.count(b'${paths.join') \
+   or out.count(b'...(paths||["."])') != 1 or out.count(b'|| "Staged"') != 1 \
+   or out.count(b'if (config.sync?.enabled === false) return;') != 1:
+    print("VERIFY_FAILED"); sys.exit(4)
+
+open(p, "wb").write(out)
+print("PATCHED")
+PY
+then
+  # Re-sign ad-hoc (arm64 requires a valid signature) and verify it launches.
+  if codesign -f -s - "$TMP" >/dev/null 2>&1 && codesign -v "$TMP" >/dev/null 2>&1 \
+     && "$TMP" --version >/dev/null 2>&1; then
+    mv -f "$TMP" "$FORK" && chmod 711 "$FORK"
+    printf '%s\n' "$curhash" > "$HASHFILE"
+    say "fork rebuilt + signed + verified OK -> $FORK"
+    exit 0
+  else
+    say "ERROR: codesign/verify failed — removing temp, guard falls back to stock"
+    rm -f "$TMP"
+    exit 1
+  fi
+else
+  # Patch patterns not found in this stock binary. Either upstream fixed the bug or
+  # restructured gitAdd. Remove the stale fork so the guard uses stock cleanly.
+  rm -f "$TMP"
+  if [ -e "$FORK" ]; then
+    rm -f "$FORK" "$HASHFILE"
+    say "patch patterns NOT found in new autohand — removed stale fork; guard now uses stock (verify the git_add bug is gone upstream)"
+  else
+    say "patch patterns NOT found and no fork present — using stock"
+  fi
+  exit 0
+fi

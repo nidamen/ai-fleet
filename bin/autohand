@@ -5,7 +5,14 @@
 # owner has NOT opted into paid (marker ~/.autohand/.allow-paid), force the free default.
 # Per-run --model from the ah-gpt/ah-claude/ah-grok launchers still overrides for that run
 # (those launchers do their own paid confirmation). Real binary: ~/.local/bin/autohand.
+# Prefer the locally-patched fork (fixes the 0.9.1 git_add spread-null crash when the
+# model omits `paths`; see reference_autohand_openrouter memory). Falls back to the stock
+# binary if the fork is ever missing/removed. autohand-refork keeps the fork in sync with
+# the stock binary across updates (hash-gated: a no-op unless autohand changed). The daily
+# LaunchAgent also runs it; this call makes the very first launch after an update self-heal.
+[ -x "$HOME/bin/autohand-refork" ] && "$HOME/bin/autohand-refork" >/dev/null 2>&1
 REAL="$HOME/.local/bin/autohand"
+[ -x "$HOME/bin/.autohand-patched" ] && REAL="$HOME/bin/.autohand-patched"
 CFG="$HOME/.autohand/config.json"
 PREF="$HOME/.autohand/.preferred-model"
 FREE_DEFAULT="openai/gpt-oss-120b:free"
@@ -15,8 +22,11 @@ if [ -f "$CFG" ]; then
   MODEL=""; [ -f "$PREF" ] && MODEL="$(tr -d '[:space:]' < "$PREF" 2>/dev/null)"
   [ -n "$MODEL" ] || MODEL="$FREE_DEFAULT"
   ALLOW_PAID=0; [ -f "$HOME/.autohand/.allow-paid" ] && ALLOW_PAID=1
-  AH_KEY="$KEY" AH_MODEL="$MODEL" AH_FREE="$FREE_DEFAULT" AH_ALLOW_PAID="$ALLOW_PAID" \
-    /usr/bin/python3 - "$CFG" >/dev/null 2>&1 <<'PY'
+  # Re-pin key+model AND detect a wiped MCP server list. A fresh login / "restore from
+  # cloud" overwrites config.json with the stale cloud snapshot, which strips mcp.servers
+  # down to {"enabled":true} (0 servers). The python block prints MCP_WIPED in that case.
+  AH_STATUS="$(AH_KEY="$KEY" AH_MODEL="$MODEL" AH_FREE="$FREE_DEFAULT" AH_ALLOW_PAID="$ALLOW_PAID" \
+    /usr/bin/python3 - "$CFG" 2>/dev/null <<'PY'
 import json, os, sys
 cfg = sys.argv[1]
 key = os.environ.get("AH_KEY", "")
@@ -27,21 +37,131 @@ allow_paid = os.environ.get("AH_ALLOW_PAID") == "1"
 if model and not model.endswith(":free") and not allow_paid:
     model = free
 try:
-    with open(cfg) as f:
-        c = json.load(f)
+    try:
+        with open(cfg) as f:
+            c = json.load(f)
+        if not isinstance(c, dict):
+            raise ValueError("config root is not an object")
+    except Exception:
+        # Unparseable config means NO healing this launch and the binary may
+        # regenerate defaults with sync enabled. Surface it instead of hiding it.
+        print("CFG_UNPARSEABLE")
+        raise
+    changed = False
     o = c.get("openrouter")
     if isinstance(o, dict):
-        changed = False
         if key.startswith("sk-or-v1-") and o.get("apiKey") != key:
             o["apiKey"] = key; changed = True
         if model and o.get("model") != model:
             o["model"] = model; changed = True
-        if changed:
-            with open(cfg, "w") as f:
-                f.write(json.dumps(c, indent=2) + "\n")
+    # KEEP CLOUD SESSION SYNC OFF (root cause of the recurring "Session sync failed"
+    # banner, diagnosed 2026-06-10). The Autohand SyncService treats ANY config.json hash
+    # mismatch as a conflict and resolves it cloud-wins; on download it decrypts
+    # sensitive fields with the CURRENT auth token, and when the cloud copy was
+    # encrypted under an OLDER token the decrypt fails and it silently writes the
+    # still-encrypted AES-GCM blob ("iv:tag:cipher") into auth.token. Every later
+    # launch then sends that blob as the Bearer token -> 401 -> the banner, and every
+    # /login is re-clobbered within one sync interval. The same cloud-wins restore is
+    # what wipes mcp.servers. Sync stays disabled; this config is managed locally.
+    sync = c.get("sync")
+    if not (isinstance(sync, dict) and sync.get("enabled") is False):
+        c["sync"] = {"enabled": False}; changed = True
+    # Scrub a clobbered auth token: a real token is opaque; the clobbered one is a
+    # 3-part base64 "iv:tag:cipher" blob (16-byte iv + 16-byte tag). Drop auth so
+    # autohand starts cleanly logged-out instead of 401-ing with garbage. The whole
+    # scrub is wrapped so a malformed auth value can never abort the sync-off write.
+    try:
+        import base64
+        a = c.get("auth")
+        tok = a.get("token", "") if isinstance(a, dict) else ""
+        parts = tok.split(":") if isinstance(tok, str) else []
+        if len(parts) == 3:
+            if len(base64.b64decode(parts[0])) == 16 and len(base64.b64decode(parts[1])) == 16:
+                c.pop("auth", None); changed = True
+    except Exception:
+        pass
+    if changed:
+        with open(cfg, "w") as f:
+            f.write(json.dumps(c, indent=2) + "\n")
+    # Stale sync state from the pre-fix era would hand a future sync re-enable an
+    # instant manifest-hash conflict (= cloud-wins clobber on the first cycle), so
+    # clear it while sync is off. Config holds live secrets; keep it owner-only.
+    try:
+        os.path.exists(os.path.expanduser("~/.autohand/.sync-state.json")) and os.remove(os.path.expanduser("~/.autohand/.sync-state.json"))
+        os.chmod(cfg, 0o600)
+    except Exception:
+        pass
+    # Signal a wiped MCP server list so the guard can self-heal it.
+    servers = c.get("mcp", {}).get("servers", [])
+    if not isinstance(servers, list) or len(servers) == 0:
+        print("MCP_WIPED")
 except Exception:
     pass  # never block autohand from launching
 PY
+)"
+  # Self-heal a wiped MCP server list via the sanctioned parity tool (rebuilds mcp.servers
+  # from the canonical Claude+Codex union). Only runs in the wiped state, so normal launches
+  # stay fast (no live probe). Then remind to relaunch — autohand only reads MCP at startup.
+  case "$AH_STATUS" in
+    *CFG_UNPARSEABLE*)
+      printf '\033[31m✗ ~/.autohand/config.json is corrupt JSON: launch guard could NOT heal it this run (sync-off, key/model pinning, blob scrub all skipped). Fix or restore it from a ~/.autohand/config.json.bak.* backup.\033[0m\n' >&2
+      ;;
+    *MCP_WIPED*)
+      DOCTOR=""
+      for d in "$HOME/bin/mcp-doctor" "$HOME/code/personal/mcp-parity/mcp-doctor"; do
+        [ -x "$d" ] && DOCTOR="$d" && break
+      done
+      if [ -n "$DOCTOR" ]; then
+        printf '\033[33m⚠ Autohand MCP servers were wiped (cloud restore). Healing via mcp-doctor --fix…\033[0m\n' >&2
+        "$DOCTOR" --fix >/dev/null 2>&1 \
+          && printf '\033[32m✓ MCP servers restored. If this TUI was already open, /quit and relaunch to connect them.\033[0m\n' >&2 \
+          || printf '\033[31m✗ mcp-doctor --fix failed — run it manually: mcp-doctor --fix\033[0m\n' >&2
+      else
+        printf '\033[33m⚠ Autohand MCP servers look wiped — run: mcp-doctor --fix (then relaunch)\033[0m\n' >&2
+      fi
+      ;;
+  esac
+
+  # Re-inject the Supabase Bearer header on EVERY launch. The hosted Supabase MCP
+  # (mcp.supabase.com) is OAuth-gated; autohand's HTTP client can't do the OAuth-on-401
+  # flow Claude/Codex use, so it authenticates via a Personal Access Token sent as an
+  # Authorization header. A cloud restore (and the mcp-doctor --fix rebuild above, which
+  # sources the canonical Claude/Codex union that has NO header) drops it, so we re-add it
+  # here from the Keychain (service=supabase-access-token). No token → silently skip.
+  SUPA_TOK="$(/usr/bin/security find-generic-password -a "${AI_FLEET_OR_ACCOUNT:-$USER}" -s supabase-access-token -w 2>/dev/null)"
+  case "$SUPA_TOK" in
+    sbp_*)
+      AH_SUPA_TOK="$SUPA_TOK" /usr/bin/python3 - "$CFG" >/dev/null 2>&1 <<'PY'
+import json, os, sys
+cfg = sys.argv[1]; tok = os.environ.get("AH_SUPA_TOK", "")
+try:
+    with open(cfg) as f:
+        c = json.load(f)
+    want = [{"name": "Authorization", "value": f"Bearer {tok}"}]
+    changed = False
+    for s in c.get("mcp", {}).get("servers", []):
+        if s.get("name") in ("supabase", "supabase-legal") and s.get("headers") != want:
+            s["headers"] = want; changed = True
+    if changed:
+        with open(cfg, "w") as f:
+            f.write(json.dumps(c, indent=2) + "\n")
+except Exception:
+    pass  # never block autohand from launching
+PY
+      ;;
+  esac
+fi
+
+# Fleet visibility: stamp this launch into the shared sink so Hermes sees every
+# OpenRouter agent start (model + task + cwd), not just Hermes' own workers. Best
+# effort, never blocks the launch. The actual reasoning/tool-calls land in
+# ~/.autohand/sessions/<id>/ which Hermes reads directly.
+if [ -x "$HOME/bin/fleet-emit" ]; then
+  AH_MODEL_NOW="$FREE_DEFAULT"; [ -f "$PREF" ] && AH_MODEL_NOW="$(tr -d '[:space:]' < "$PREF" 2>/dev/null)"
+  # a -p "task" headless run carries its task on the command line; capture a short slice
+  AH_TASK=""; case " $* " in *" -p "*) AH_TASK="$(printf '%s' "$*" | sed 's/.*-p //' | cut -c1-160)";; esac
+  FLEET_PAYLOAD="$(FLEET_M="$AH_MODEL_NOW" FLEET_T="$AH_TASK" FLEET_C="$(pwd)" /usr/bin/python3 -c 'import json,os;print(json.dumps({"runner":"autohand","model":os.environ.get("FLEET_M",""),"task":os.environ.get("FLEET_T",""),"cwd":os.environ.get("FLEET_C","")}))' 2>/dev/null)"
+  "$HOME/bin/fleet-emit" launch "$FLEET_PAYLOAD" 2>/dev/null
 fi
 
 exec "$REAL" "$@"
