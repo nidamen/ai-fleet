@@ -31,8 +31,16 @@ fi
 if security find-generic-password -s openrouter -a "$ACCOUNT" -w >/dev/null 2>&1; then
   echo "    OpenRouter key already in Keychain (service=openrouter account=$ACCOUNT)"
 else
-  printf "    Paste your OpenRouter API key (from https://openrouter.ai/keys), or leave blank to skip: "
-  stty -echo 2>/dev/null || true; read OR_KEY; stty echo 2>/dev/null || true; echo
+  # Prompt ONLY when there's a real terminal, and with a timeout, so an UNATTENDED
+  # run (no TTY, e.g. over `tailscale ssh` or piped) never hangs invisibly waiting
+  # for a paste that will never come. No TTY -> skip cleanly, set the key later.
+  OR_KEY=""
+  if [ -t 0 ]; then
+    printf "    Paste your OpenRouter API key (from https://openrouter.ai/keys), or leave blank to skip: "
+    stty -echo 2>/dev/null || true; read -t 120 OR_KEY 2>/dev/null || true; stty echo 2>/dev/null || true; echo
+  else
+    echo "    no terminal (unattended) -> skipping OpenRouter key prompt; set it later."
+  fi
   if [ -n "${OR_KEY:-}" ]; then
     security add-generic-password -U -s openrouter -a "$ACCOUNT" -w "$OR_KEY"
     mkdir -p "$HOME/.config/openrouter"; printf '%s' "$OR_KEY" > "$HOME/.config/openrouter/key"; chmod 600 "$HOME/.config/openrouter/key"
